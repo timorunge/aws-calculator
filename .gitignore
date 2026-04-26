@@ -1,11 +1,19 @@
 # Python bytecode
-__pycache__/
-*.py[cod]
-*.egg
 *.egg-info/
+__pycache__/
+*.egg
+*.py[cod]
+.coverage
 
 # Virtual environment
 .venv/
+
+# Build artifacts
+dist/
+build/
+
+# macOS
+.DS_Store
 
 # Tool caches
 .pytest_cache/

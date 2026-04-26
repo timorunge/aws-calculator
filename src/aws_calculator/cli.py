@@ -1,11 +1,13 @@
-"""Command-line interface for reading shared AWS Pricing Calculator estimates."""
+"""Command-line interface for reading and writing AWS Pricing Calculator estimates."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -13,17 +15,27 @@ from aws_calculator import __version__
 from aws_calculator.core import (
     CALCULATOR_ESC_URL,
     CALCULATOR_GLOBAL_URL,
+    DEFAULT_REGION,
+    CatalogError,
+    EstimateBuilder,
+    EstimateBuildError,
     EstimateClient,
     EstimateFetchError,
+    ManifestClient,
+    Partition,
     ResponseFormat,
+    SaveClient,
+    SaveError,
     discover_estimate_api_url,
     format_estimate_overview,
     format_estimate_summary,
+    format_export_result,
+    format_search_results,
     format_service_detail,
+    format_service_fields,
     format_services_list,
 )
-
-_MAX_KEYS_IN_ERROR = 5
+from aws_calculator.core.types import MAX_KEYS_IN_ERROR
 
 
 async def _cmd_get_estimate(args: argparse.Namespace, client: EstimateClient) -> int:
@@ -54,9 +66,9 @@ async def _cmd_get_service_detail(args: argparse.Namespace, client: EstimateClie
 
     service = estimate.services.get(args.service_key)
     if not service:
-        available = ", ".join(f"'{k}'" for k in list(estimate.services.keys())[:_MAX_KEYS_IN_ERROR])
+        available = ", ".join(f"'{k}'" for k in list(estimate.services.keys())[:MAX_KEYS_IN_ERROR])
         n = len(estimate.services)
-        more = f" (and {n - _MAX_KEYS_IN_ERROR} more)" if n > _MAX_KEYS_IN_ERROR else ""
+        more = f" (and {n - MAX_KEYS_IN_ERROR} more)" if n > MAX_KEYS_IN_ERROR else ""
         print(
             f"error: service key '{args.service_key}' not found in estimate. "
             f"available keys: {available}{more}. "
@@ -79,7 +91,7 @@ async def _cmd_summarize(args: argparse.Namespace, client: EstimateClient) -> in
     return 0
 
 
-_COMMANDS: dict[str, Callable[[argparse.Namespace, EstimateClient], Awaitable[int]]] = {
+_READ_COMMANDS: dict[str, Callable[[argparse.Namespace, EstimateClient], Awaitable[int]]] = {
     "get-estimate": _cmd_get_estimate,
     "list-services": _cmd_list_services,
     "get-service-detail": _cmd_get_service_detail,
@@ -87,10 +99,103 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, EstimateClient], Awaitable[in
 }
 
 
+async def _cmd_search_services(args: argparse.Namespace, catalog: ManifestClient) -> int:
+    partition = Partition(args.partition)
+    manifest = await catalog.load_manifest(partition)
+    results = catalog.search_services(manifest, args.query, args.max_results)
+    print(format_search_results(results, ResponseFormat(args.format)))
+    return 0
+
+
+async def _cmd_get_service_fields(args: argparse.Namespace, catalog: ManifestClient) -> int:
+    partition = Partition(args.partition)
+    manifest = await catalog.load_manifest(partition)
+    keys = [k.strip() for k in args.service.split(",") if k.strip()]
+    services, errors = await catalog.resolve_fields(manifest, keys, partition)
+    print(format_service_fields(services, errors, ResponseFormat(args.format)))
+    return 1 if not services else 0
+
+
+async def _cmd_compose_estimate(
+    args: argparse.Namespace, catalog: ManifestClient, saver: SaveClient
+) -> int:
+    try:
+        with open(args.services_file) as f:
+            spec: dict[str, Any] = json.load(f)
+    except FileNotFoundError:
+        print(f"error: file not found: {args.services_file}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"error: invalid JSON in {args.services_file}: {e}", file=sys.stderr)
+        return 1
+
+    name = spec.get("name", "My Estimate")
+    partition_str = spec.get("partition", Partition.AWS.value)
+    try:
+        partition = Partition(partition_str)
+    except ValueError:
+        print(f"error: invalid partition '{partition_str}'", file=sys.stderr)
+        return 1
+
+    entries = spec.get("services") or []
+    if not isinstance(entries, list):
+        print("error: 'services' must be a JSON array", file=sys.stderr)
+        return 1
+
+    if not entries:
+        print("error: no services in spec file", file=sys.stderr)
+        return 1
+
+    builder = EstimateBuilder(name, partition)
+    for entry in entries:
+        service_code = entry.get("serviceCode")
+        if not service_code:
+            print("error: service entry missing 'serviceCode' key", file=sys.stderr)
+            return 1
+        builder.add_service(
+            service_code,
+            region=entry.get("region", DEFAULT_REGION),
+            description=entry.get("description", ""),
+            calculation_components=entry.get("calculationComponents", {}),
+            group=entry.get("group"),
+        )
+
+    payload = await builder.build_payload(catalog)
+    result = await saver.save(payload, partition)
+    print(format_export_result(result, ResponseFormat(args.format)))
+    return 0
+
+
+_CATALOG_COMMANDS: dict[str, Callable[[argparse.Namespace, ManifestClient], Awaitable[int]]] = {
+    "search-services": _cmd_search_services,
+    "get-service-fields": _cmd_get_service_fields,
+}
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("url_or_id", help="Calculator URL or bare estimate ID")
-    common.add_argument(
+    common_read = argparse.ArgumentParser(add_help=False)
+    common_read.add_argument("url_or_id", help="Calculator URL or bare estimate ID")
+    common_read.add_argument(
+        "-f",
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        dest="format",
+        help="output format (default: text)",
+    )
+
+    _partition_choices = [p.value for p in Partition]
+
+    common_partition = argparse.ArgumentParser(add_help=False)
+    common_partition.add_argument(
+        "--partition",
+        choices=_partition_choices,
+        default=Partition.AWS.value,
+        help="AWS partition (default: aws)",
+    )
+
+    common_format = argparse.ArgumentParser(add_help=False)
+    common_format.add_argument(
         "-f",
         "--format",
         choices=["text", "json"],
@@ -101,7 +206,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="aws-calculator",
-        description="Read shared AWS Pricing Calculator estimates.",
+        description="Read and create AWS Pricing Calculator estimates.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
@@ -109,13 +214,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "get-estimate",
-        parents=[common],
+        parents=[common_read],
         help="estimate overview (name, costs, metadata)",
     )
 
     ls = subparsers.add_parser(
         "list-services",
-        parents=[common],
+        parents=[common_read],
         help="list all services with costs and config",
     )
     ls.add_argument(
@@ -126,7 +231,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     detail = subparsers.add_parser(
         "get-service-detail",
-        parents=[common],
+        parents=[common_read],
         help="full configuration for one service",
     )
     detail.add_argument(
@@ -137,9 +242,36 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "summarize",
-        parents=[common],
+        parents=[common_read],
         help="cost breakdown with group subtotals, services ranked by cost",
     )
+
+    search = subparsers.add_parser(
+        "search-services",
+        parents=[common_format, common_partition],
+        help="search the AWS service catalog",
+    )
+    search.add_argument("query", help="search terms (comma-separated)")
+    search.add_argument(
+        "--max-results",
+        type=int,
+        default=20,
+        help="max results per term (default: 20)",
+    )
+
+    fields = subparsers.add_parser(
+        "get-service-fields",
+        parents=[common_format, common_partition],
+        help="show configuration fields for a service",
+    )
+    fields.add_argument("service", help="service key(s), comma-separated")
+
+    compose = subparsers.add_parser(
+        "compose-estimate",
+        parents=[common_format],
+        help="create an estimate from a JSON spec file and save to calculator.aws",
+    )
+    compose.add_argument("services_file", help="path to JSON spec file")
 
     return parser
 
@@ -151,23 +283,42 @@ async def _run(args: argparse.Namespace) -> int:
             "User-Agent": f"aws-calculator/{__version__}",
         },
     ) as http_client:
-        global_api_url, esc_api_url = await asyncio.gather(
-            discover_estimate_api_url(http_client, CALCULATOR_GLOBAL_URL),
-            discover_estimate_api_url(http_client, CALCULATOR_ESC_URL),
-        )
+        if args.command in _READ_COMMANDS:
+            global_api_url, esc_api_url = await asyncio.gather(
+                discover_estimate_api_url(http_client, CALCULATOR_GLOBAL_URL),
+                discover_estimate_api_url(http_client, CALCULATOR_ESC_URL),
+            )
+            api_urls: dict[str, str] = {}
+            if global_api_url:
+                api_urls[CALCULATOR_GLOBAL_URL] = global_api_url
+            if esc_api_url:
+                api_urls[CALCULATOR_ESC_URL] = esc_api_url
+            client = EstimateClient(http_client, api_urls)
+            try:
+                return await _READ_COMMANDS[args.command](args, client)
+            except EstimateFetchError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
 
-        api_urls = {CALCULATOR_GLOBAL_URL: global_api_url}
-        if esc_api_url:
-            api_urls[CALCULATOR_ESC_URL] = esc_api_url
+        catalog = ManifestClient(http_client)
 
-        client = EstimateClient(http_client, api_urls)
+        if args.command in _CATALOG_COMMANDS:
+            try:
+                return await _CATALOG_COMMANDS[args.command](args, catalog)
+            except CatalogError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
 
-        handler = _COMMANDS[args.command]
-        try:
-            return await handler(args, client)
-        except EstimateFetchError as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 1
+        if args.command == "compose-estimate":
+            saver = SaveClient(http_client)
+            try:
+                return await _cmd_compose_estimate(args, catalog, saver)
+            except (CatalogError, EstimateBuildError, SaveError) as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+
+        print(f"error: unknown command '{args.command}'", file=sys.stderr)
+        return 1
 
 
 def main() -> None:

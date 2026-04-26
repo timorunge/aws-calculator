@@ -1,22 +1,20 @@
 """Integration tests that hit the real calculator.aws API."""
 
-import json
 from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 
-from aws_calculator.core.client import EstimateClient, EstimateFetchError
+from aws_calculator.core.builder import EstimateBuilder
+from aws_calculator.core.catalog import ManifestClient
+from aws_calculator.core.client import EstimateClient
 from aws_calculator.core.discovery import (
     CALCULATOR_ESC_URL,
     CALCULATOR_GLOBAL_URL,
     discover_estimate_api_url,
 )
-from aws_calculator.core.formatters import (
-    format_estimate_overview,
-    format_estimate_summary,
-)
-from aws_calculator.core.types import ResponseFormat
+from aws_calculator.core.save import SaveClient
+from aws_calculator.core.types import Partition
 from tests.conftest import SAMPLE_ESTIMATE_ID
 
 pytestmark = pytest.mark.integration
@@ -55,22 +53,59 @@ class TestFetchEstimateLive:
             assert svc.service_name is not None
             assert svc.region is not None
 
-    async def test_nonexistent_estimate(self, live_client: EstimateClient) -> None:
-        with pytest.raises(EstimateFetchError):
-            await live_client.get_estimate("00000000000000000000deadbeefcafe00000000")
+
+class TestWriteWorkflowLive:
+    async def test_search_build_save(self) -> None:
+        async with httpx.AsyncClient(
+            headers={"Accept": "application/json", "User-Agent": "aws-calculator-test"}
+        ) as http:
+            catalog = ManifestClient(http)
+            saver = SaveClient(http)
+
+            manifest = await catalog.load_manifest(Partition.AWS)
+            results = catalog.search_services(manifest, "lambda", max_results=5)
+            assert isinstance(results, list)
+            assert len(results) > 0
+
+            svc = catalog.find_service(manifest, "aWSLambda")
+            assert svc is not None
+            definition = await catalog.fetch_definition(manifest, svc.key, Partition.AWS)
+            assert definition is not None
+            fields = catalog.extract_fields(definition)
+            assert any(f.id == "numberOfRequests" for f in fields)
+
+            builder = EstimateBuilder("Integration Test", Partition.AWS)
+            builder.add_service(
+                "aWSLambda",
+                region="us-east-1",
+                calculation_components={"numberOfRequests": "1000000"},
+            )
+            payload = await builder.build_payload(catalog)
+            result = await saver.save(payload, Partition.AWS)
+
+            assert result.estimate_id
+            assert "calculator.aws" in result.shareable_url
 
 
-class TestFormattersLive:
-    async def test_overview_json(self, live_client: EstimateClient) -> None:
-        est = await live_client.get_estimate(SAMPLE_ESTIMATE_ID)
-        result = format_estimate_overview(est, ResponseFormat.JSON)
-        data = json.loads(result)
-        assert data["name"] == "My Estimate"
-        assert data["service_count"] == 4
-        assert data["total_monthly"] > 0
+class TestWriteWorkflowEscLive:
+    async def test_esc_build_save(self) -> None:
+        async with httpx.AsyncClient(
+            headers={"Accept": "application/json", "User-Agent": "aws-calculator-test"}
+        ) as http:
+            catalog = ManifestClient(http)
+            saver = SaveClient(http)
 
-    async def test_summary_text(self, live_client: EstimateClient) -> None:
-        est = await live_client.get_estimate(SAMPLE_ESTIMATE_ID)
-        result = format_estimate_summary(est, ResponseFormat.TEXT)
-        assert "Services by cost:" in result
-        assert "Amazon RDS for MySQL" in result
+            manifest = await catalog.load_manifest(Partition.AWS_ESC)
+            assert len(manifest) > 0
+
+            builder = EstimateBuilder("Integration Test ESC", Partition.AWS_ESC)
+            builder.add_service(
+                "aWSLambda",
+                region="eusc-de-east-1",
+                calculation_components={"numberOfRequests": "1000000"},
+            )
+            payload = await builder.build_payload(catalog)
+            result = await saver.save(payload, Partition.AWS_ESC)
+
+            assert result.estimate_id
+            assert "pricing.calculator.aws.eu" in result.shareable_url

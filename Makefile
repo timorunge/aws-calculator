@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: install fmt fmt-fix lint lint-fix type test test-ci test-coverage check ci-local clean help
+.PHONY: install fmt fmt-fix lint lint-fix type test test-ci test-coverage test-manual check ci-local clean help
 
 ## install: Install all dependencies (including dev extras)
 install:
@@ -37,6 +37,11 @@ test-ci:
 ## test-coverage: Run tests with coverage report
 test-coverage:
 	uv run pytest -m "not integration" --cov=aws_calculator --cov-report=term-missing
+
+## test-manual: Run manual tests (hits live API)
+test-manual:
+	uv run python tests/manual/test_cli.py
+	uv run python tests/manual/test_mcp.py
 
 ## check: Run all quality gates (fmt lint type test)
 check: fmt lint type test

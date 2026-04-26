@@ -5,13 +5,24 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from aws_calculator.core.types import Estimate, EstimateService, ResponseFormat
+from aws_calculator.core.types import (
+    DEFAULT_CURRENCY,
+    Estimate,
+    EstimateService,
+    ResponseFormat,
+    SaveResult,
+    ServiceField,
+)
 
 _MAX_COMPONENT_VALUE_LEN = 80
+_UNGROUPED_LABEL = "(ungrouped)"
+
+
+def _json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"))
 
 
 def _format_component_value(value: Any) -> str:
-    """Render a component value as a short string."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -27,16 +38,20 @@ def _format_cost(amount: float, currency: str) -> str:
 
 
 def _build_overview_dict(estimate: Estimate) -> dict[str, Any]:
-    return {
+    d: dict[str, Any] = {
         "name": estimate.name,
-        "total_monthly": estimate.total_cost.monthly,
-        "total_upfront": estimate.total_cost.upfront,
-        "service_count": len(estimate.services),
+        "monthly": estimate.total_cost.monthly,
+        "upfront": estimate.total_cost.upfront,
+        "services": len(estimate.services),
         "currency": estimate.meta_data.currency,
-        "created_on": estimate.meta_data.created_on,
-        "estimate_id": estimate.meta_data.estimate_id,
-        "groups": list(estimate.groups.keys()) if estimate.groups else [],
     }
+    if estimate.meta_data.created_on:
+        d["created"] = estimate.meta_data.created_on
+    if estimate.meta_data.estimate_id:
+        d["id"] = estimate.meta_data.estimate_id
+    if estimate.groups:
+        d["groups"] = list(estimate.groups.keys())
+    return d
 
 
 def _aggregate_group_costs(
@@ -44,14 +59,14 @@ def _aggregate_group_costs(
 ) -> dict[str, float]:
     costs: dict[str, float] = {}
     for _key, svc in services:
-        g = svc.group or "(ungrouped)"
+        g = svc.group or _UNGROUPED_LABEL
         costs[g] = costs.get(g, 0.0) + svc.service_cost.monthly
     return costs
 
 
 def format_estimate_overview(estimate: Estimate, fmt: ResponseFormat) -> str:
     if fmt == ResponseFormat.JSON:
-        return json.dumps(_build_overview_dict(estimate), indent=2)
+        return _json(_build_overview_dict(estimate))
 
     e = estimate
     c = e.meta_data.currency
@@ -75,34 +90,28 @@ def format_services_list(
     fmt: ResponseFormat,
 ) -> str:
     if fmt == ResponseFormat.JSON:
-        items = [
-            {
+        items = []
+        for key, svc in services.items():
+            item: dict[str, Any] = {
                 "key": key,
-                "service_name": svc.service_name or "",
-                "service_code": svc.service_code or "",
+                "name": svc.service_name or "",
                 "region": svc.region_name or svc.region or "",
-                "monthly_cost": svc.service_cost.monthly,
-                "config_summary": svc.config_summary,
-                "group": svc.group,
+                "monthly": svc.service_cost.monthly,
             }
-            for key, svc in services.items()
-        ]
-        return json.dumps(
-            {
-                "estimate_name": estimate.name,
-                "service_count": len(items),
-                "services": items,
-            },
-            indent=2,
-        )
+            if svc.config_summary:
+                item["config"] = svc.config_summary
+            if svc.group:
+                item["group"] = svc.group
+            items.append(item)
+        return _json({"name": estimate.name, "services": items})
 
     c = estimate.meta_data.currency
-    lines = [f'{len(services)} services in "{estimate.name}"', ""]
 
     grouped: dict[str | None, list[tuple[str, EstimateService]]] = {}
     for key, svc in services.items():
         grouped.setdefault(svc.group, []).append((key, svc))
 
+    lines: list[str] = []
     for group_name, group_services in grouped.items():
         if group_name:
             lines.append(f"[{group_name}]")
@@ -112,7 +121,7 @@ def format_services_list(
             cost = _format_cost(svc.service_cost.monthly, c)
             name = svc.service_name or ""
             config = f" -- {svc.config_summary}" if svc.config_summary else ""
-            lines.append(f"- {name} | {region} | {cost} | key: {key}{config}")
+            lines.append(f"  {name} | {region} | {cost} | key: {key}{config}")
 
         lines.append("")
 
@@ -120,27 +129,28 @@ def format_services_list(
 
 
 def format_service_detail(
-    key: str, service: EstimateService, fmt: ResponseFormat, currency: str = "USD"
+    key: str, service: EstimateService, fmt: ResponseFormat, currency: str = DEFAULT_CURRENCY
 ) -> str:
     if fmt == ResponseFormat.JSON:
         components = {
             name: {"value": comp.value, "unit": comp.unit}
             for name, comp in service.calculation_components.items()
         }
-        return json.dumps(
-            {
-                "key": key,
-                "service_name": service.service_name or "",
-                "service_code": service.service_code or "",
-                "region": service.region_name or service.region or "",
-                "monthly_cost": service.service_cost.monthly,
-                "config_summary": service.config_summary,
-                "description": service.description,
-                "group": service.group,
-                "calculation_components": components,
-            },
-            indent=2,
-        )
+        d: dict[str, Any] = {
+            "key": key,
+            "name": service.service_name or "",
+            "code": service.service_code or "",
+            "region": service.region_name or service.region or "",
+            "monthly": service.service_cost.monthly,
+            "components": components,
+        }
+        if service.config_summary:
+            d["config"] = service.config_summary
+        if service.description:
+            d["description"] = service.description
+        if service.group:
+            d["group"] = service.group
+        return _json(d)
 
     lines = [
         service.service_name or "",
@@ -177,25 +187,23 @@ def format_estimate_summary(estimate: Estimate, fmt: ResponseFormat) -> str:
     group_costs = _aggregate_group_costs(services_by_cost)
 
     if fmt == ResponseFormat.JSON:
-        return json.dumps(
+        return _json(
             {
-                "estimate_name": estimate.name,
+                "name": estimate.name,
                 "currency": estimate.meta_data.currency,
-                "total_monthly": estimate.total_cost.monthly,
-                "total_upfront": estimate.total_cost.upfront,
-                "group_subtotals": group_costs,
-                "services_by_cost": [
+                "monthly": estimate.total_cost.monthly,
+                "upfront": estimate.total_cost.upfront,
+                "groups": group_costs,
+                "services": [
                     {
-                        "service_name": svc.service_name or "",
+                        "name": svc.service_name or "",
                         "region": svc.region_name or svc.region or "",
-                        "monthly_cost": svc.service_cost.monthly,
+                        "monthly": svc.service_cost.monthly,
                         "group": svc.group,
                     }
                     for _key, svc in services_by_cost
                 ],
-                "support": estimate.support or None,
-            },
-            indent=2,
+            }
         )
 
     c = estimate.meta_data.currency
@@ -206,10 +214,10 @@ def format_estimate_summary(estimate: Estimate, fmt: ResponseFormat) -> str:
         f"Total upfront: {_format_cost(estimate.total_cost.upfront, c)}",
     ]
 
-    if len(group_costs) > 1 or list(group_costs.keys()) != ["(ungrouped)"]:
+    if group_costs and (len(group_costs) > 1 or set(group_costs) != {_UNGROUPED_LABEL}):
         lines.append("")
         lines.append("Group subtotals:")
-        for group_name, cost in sorted(group_costs.items(), key=lambda x: -x[1]):
+        for group_name, cost in sorted(group_costs.items(), key=lambda x: x[1], reverse=True):
             lines.append(f"  {group_name}: {_format_cost(cost, c)}/mo")
 
     lines.append("")
@@ -233,3 +241,102 @@ def format_estimate_summary(estimate: Estimate, fmt: ResponseFormat) -> str:
                 lines.append(f"  {plan_key}: {cost_str}")
 
     return "\n".join(lines)
+
+
+def format_search_results(
+    results: list[dict[str, str]] | dict[str, list[dict[str, str]]],
+    fmt: ResponseFormat,
+) -> str:
+    if fmt == ResponseFormat.JSON:
+        return _json(results)
+
+    if isinstance(results, list):
+        if not results:
+            return "No services found."
+        return "\n".join(f"  {r['key']} -- {r['name']}" for r in results)
+
+    lines: list[str] = []
+    for term, matches in results.items():
+        lines.append(f"[{term}] {len(matches)} results")
+        for r in matches:
+            lines.append(f"  {r['key']} -- {r['name']}")
+    return "\n".join(lines)
+
+
+def format_service_fields(
+    services: list[dict[str, Any]],
+    errors: list[str],
+    fmt: ResponseFormat,
+) -> str:
+    if fmt == ResponseFormat.JSON:
+        compact_services = []
+        for svc_info in services:
+            fields: list[ServiceField] = svc_info["fields"]
+            compact_fields = []
+            for f in fields:
+                fd: dict[str, Any] = {"id": f.id, "type": f.type}
+                if f.label:
+                    fd["label"] = f.label
+                if f.options:
+                    fd["options"] = [o.id or o.label or "" for o in f.options]
+                if f.unit_format:
+                    fd["format"] = f.unit_format
+                compact_fields.append(fd)
+            compact_services.append(
+                {
+                    "key": svc_info["key"],
+                    "name": svc_info["name"],
+                    "fields": compact_fields,
+                }
+            )
+        obj: dict[str, Any] = {"services": compact_services}
+        if errors:
+            obj["errors"] = errors
+        return _json(obj)
+
+    lines: list[str] = []
+    for svc_info in services:
+        name = svc_info.get("name") or svc_info["key"]
+        text_fields: list[ServiceField] = svc_info["fields"]
+        lines.append(f"{name} ({len(text_fields)} fields):")
+        for f in text_fields:
+            label = f" -- {f.label}" if f.label else ""
+            lines.append(f"  {f.id} ({f.type}){label}")
+            if f.options:
+                opts = ", ".join(o.id or o.label or "" for o in f.options[:10])
+                lines.append(f"    options: [{opts}]")
+            if f.unit_format:
+                lines.append(f"    format: {f.unit_format}")
+        lines.append("")
+
+    for err in errors:
+        lines.append(f"error: {err}")
+
+    return "\n".join(lines)
+
+
+def format_estimate_created(estimate_id: str, name: str, fmt: ResponseFormat) -> str:
+    if fmt == ResponseFormat.JSON:
+        return _json({"id": estimate_id, "name": name})
+    return f"Estimate created: {name}\nID: {estimate_id}"
+
+
+def format_add_service_results(results: list[dict[str, Any]], fmt: ResponseFormat) -> str:
+    if fmt == ResponseFormat.JSON:
+        return _json({"results": results})
+
+    added = sum(1 for r in results if r.get("status") == "added")
+    lines = [f"{added} added"]
+    for r in results:
+        service = r.get("service", "")
+        if r.get("status") == "added":
+            lines.append(f"  + {service}")
+        else:
+            lines.append(f"  ! {service}: {r.get('error', 'unknown error')}")
+    return "\n".join(lines)
+
+
+def format_export_result(result: SaveResult, fmt: ResponseFormat) -> str:
+    if fmt == ResponseFormat.JSON:
+        return _json({"id": result.estimate_id, "url": result.shareable_url})
+    return f"Estimate saved\nURL: {result.shareable_url}\nID: {result.estimate_id}"

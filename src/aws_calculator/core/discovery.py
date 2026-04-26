@@ -19,7 +19,7 @@ FETCH_TIMEOUT: float = 20.0
 _DISCOVERY_TIMEOUT: float = 15.0
 
 # No hardcoded fallback for the ESC calculator; it must be discovered at runtime.
-_FALLBACK_APIS: dict[str, str] = {
+_FALLBACK_APIS: dict[str, str | None] = {
     CALCULATOR_GLOBAL_URL: FALLBACK_GLOBAL_ESTIMATE_API,
 }
 
@@ -32,7 +32,6 @@ _ALLOWED_HOSTS = frozenset(
     }
 )
 
-# Matches: src="<path>/config.js"
 _CONFIG_JS_RE = re.compile(r'src="([^"]*config\.js)"')
 
 
@@ -50,8 +49,7 @@ def _extract_balanced_braces(text: str, start: int) -> str | None:
             continue
 
         if ch == "\\":
-            if string_char is not None:
-                escape_next = True
+            escape_next = True
             continue
 
         if ch in ('"', "'"):
@@ -75,7 +73,7 @@ def _extract_balanced_braces(text: str, start: int) -> str | None:
 
 
 def _find_nested_value(obj: object, target: str) -> str | None:
-    """Recursively search a nested dict/list for a key, return its value."""
+    """Recursively search a nested dict/list for a key with a string value."""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == target and isinstance(v, str):
@@ -137,14 +135,14 @@ async def _fetch_text(client: httpx.AsyncClient, url: str) -> str:
 async def discover_estimate_api_url(
     client: httpx.AsyncClient,
     base_url: str = CALCULATOR_GLOBAL_URL,
-) -> str:
+) -> str | None:
     """Discover the GET_SAVED_ESTIMATES_API URL from a calculator's config.js."""
-    fallback = _FALLBACK_APIS.get(base_url, "")
+    fallback = _FALLBACK_APIS.get(base_url)
     try:
         html = await _fetch_text(client, base_url)
         config_path = _extract_config_js_path(html)
         if not config_path:
-            logger.warning("Could not find config.js path in %s HTML", base_url)
+            logger.warning("could not find config.js path in %s HTML", base_url)
             return fallback
 
         config_url = _resolve_url(base_url, config_path)
@@ -152,7 +150,7 @@ async def discover_estimate_api_url(
 
         api_url = _extract_estimate_api_url(config_js)
         if not api_url:
-            logger.warning("Could not extract GET_SAVED_ESTIMATES_API from config.js")
+            logger.warning("could not extract GET_SAVED_ESTIMATES_API from config.js")
             return fallback
 
         # The API URL may be relative (e.g. "/getSavedEstimates/{estimateKey}").
@@ -164,5 +162,5 @@ async def discover_estimate_api_url(
         return api_url
 
     except (httpx.HTTPError, OSError, ValueError, json.JSONDecodeError) as e:
-        logger.warning("Discovery failed (%s), using fallback URL", e)
+        logger.warning("discovery failed (%s), using fallback URL", e)
         return fallback

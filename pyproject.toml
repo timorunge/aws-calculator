@@ -1,12 +1,17 @@
 [project]
 name = "aws-calculator"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI and MCP server for reading shared AWS Pricing Calculator estimates from calculator.aws and pricing.calculator.aws.eu"
 authors = [{name = "Timo Runge"}]
 requires-python = ">=3.11"
 license = {text = "MIT"}
+readme = "README.md"
 keywords = ["aws", "mcp", "pricing", "calculator", "llm"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -21,6 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+regions = [
+    "botocore>=1.30.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
@@ -35,6 +43,8 @@ aws-calculator-mcp-server = "aws_calculator.server:main"
 
 [project.urls]
 Homepage = "https://github.com/timorunge/aws-calculator"
+Source = "https://github.com/timorunge/aws-calculator"
+Changelog = "https://github.com/timorunge/aws-calculator/blob/main/CHANGELOG.md"
 Issues = "https://github.com/timorunge/aws-calculator/issues"
 
 [build-system]
@@ -62,9 +72,20 @@ mypy_path = "src"
 module = "aws_calculator.server"
 disallow_any_generics = false
 
+[[tool.mypy.overrides]]
+module = "aws_calculator.tools.*"
+disallow_any_generics = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = ["--strict-markers"]
 markers = [
     "integration: tests that hit the live calculator.aws API (require network)",
 ]
+
+[tool.coverage.run]
+source = ["aws_calculator"]
+
+[tool.coverage.report]
+omit = ["tests/*"]
