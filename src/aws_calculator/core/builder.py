@@ -28,7 +28,7 @@ def _load_region_names() -> dict[str, str]:
         return _REGION_NAMES
     regions: dict[str, str] = {}
     try:
-        from botocore.loaders import Loader  # type: ignore[import-not-found]
+        from botocore.loaders import Loader  # type: ignore[import-not-found,import-untyped,unused-ignore]  # isort: skip
 
         data = Loader().load_data("endpoints")
         for partition in data.get("partitions", []):
